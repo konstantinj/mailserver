@@ -1,86 +1,104 @@
 #!/bin/bash
 
-trap "{ echo Stopping mailserver; supervisorctl stop all; exit 0; }" EXIT
-
-
 # ENV
 export FQDN
 export DOMAIN
-export FULLCHAIN
+export VMAILUID
+export VMAILGID
+export DBHOST
+export DBNAME
+export DBUSER
 export CAFILE
 export CERTFILE
 export KEYFILE
+export FULLCHAIN
+export DISABLE_CLAMAV
+export DISABLE_SPAMASSASSIN
+export ENABLE_POSTGREY
+
 FQDN=$(hostname --fqdn)
 DOMAIN=$(hostname --domain)
-DBHOST=${DBHOST:-mariadb}
-DBUSER=${DBUSER:-postfix}
-DBNAME=${DBNAME:-postfix}
 VMAILUID=${VMAILUID:-1024}
 VMAILGID=${VMAILGID:-1024}
+DBHOST=${DBHOST:-mariadb}
+DBNAME=${DBNAME:-postfix}
+DBUSER=${DBUSER:-postfix}
+DISABLE_CLAMAV=${DISABLE_CLAMAV:-false}
+DISABLE_SPAMASSASSIN=${DISABLE_SPAMASSASSIN:-false}
+ENABLE_POSTGREY=${ENABLE_POSTGREY:-false}
 OPENDKIM_KEY_LENGTH=${OPENDKIM_KEY_LENGTH:-2048}
 ADD_DOMAINS=${ADD_DOMAINS:-}
 
-if [ -z $DBPASS ]; then
-  echo "Mariadb database password must be set !"
+if [ -z "$DBPASS" ]; then
+  echo "[ERROR] Mariadb database password must be set !"
   exit 1
 fi
 
 # SSL certificates
-LETS_ENCRYPT_LIVE_PATH=/etc/letsencrypt/live/$FQDN
+LETS_ENCRYPT_LIVE_PATH=/etc/letsencrypt/live/"$FQDN"
 
-if [ -d $LETS_ENCRYPT_LIVE_PATH ]; then
-  FULLCHAIN=$LETS_ENCRYPT_LIVE_PATH/fullchain.pem
-  CAFILE=$LETS_ENCRYPT_LIVE_PATH/chain.pem
-  CERTFILE=$LETS_ENCRYPT_LIVE_PATH/cert.pem
-  KEYFILE=$LETS_ENCRYPT_LIVE_PATH/privkey.pem
+if [ -d "$LETS_ENCRYPT_LIVE_PATH" ]; then
+
+  echo "[INFO] Let's encrypt live directory found"
+  echo "[INFO] Using $LETS_ENCRYPT_LIVE_PATH folder"
+
+  FULLCHAIN="$LETS_ENCRYPT_LIVE_PATH"/fullchain.pem
+  CAFILE="$LETS_ENCRYPT_LIVE_PATH"/chain.pem
+  CERTFILE="$LETS_ENCRYPT_LIVE_PATH"/cert.pem
+  KEYFILE="$LETS_ENCRYPT_LIVE_PATH"/privkey.pem
 
   # When using https://github.com/JrCs/docker-nginx-proxy-letsencrypt
   # and https://github.com/jwilder/nginx-proxy there is only key.pem and fullchain.pem
   # so we look for key.pem and extract cert.pem and chain.pem
-  if [ ! -e $KEYFILE ]; then
-    KEYFILE=$LETS_ENCRYPT_LIVE_PATH/key.pem
+  if [ ! -e "$KEYFILE" ]; then
+    KEYFILE="$LETS_ENCRYPT_LIVE_PATH"/key.pem
   fi
 
-  if [ ! -e $KEYFILE ]; then
-    echo "No keyfile found in $LETS_ENCRYPT_LIVE_PATH !"
+  if [ ! -e "$KEYFILE" ]; then
+    echo "[ERROR] No keyfile found in $LETS_ENCRYPT_LIVE_PATH !"
     exit 1
   fi
 
-  if [ ! -e $CAFILE ] || [ ! -e $CERTFILE ]; then
-    if [ ! -e $FULLCHAIN ]; then
-      echo "No fullchain found in $LETS_ENCRYPT_LIVE_PATH !"
-      exit
+  if [ ! -e "$CAFILE" ] || [ ! -e "$CERTFILE" ]; then
+    if [ ! -e "$FULLCHAIN" ]; then
+      echo "[ERROR] No fullchain found in $LETS_ENCRYPT_LIVE_PATH !"
+      exit 1
     fi
 
-    awk -v path=$LETS_ENCRYPT_LIVE_PATH 'BEGIN {c=0;} /BEGIN CERT/{c++} { print > path"/cert" c ".pem"}' < $FULLCHAIN
-    mv $LETS_ENCRYPT_LIVE_PATH/cert1.pem $CERTFILE
-    mv $LETS_ENCRYPT_LIVE_PATH/cert2.pem $CAFILE
+    awk -v path="$LETS_ENCRYPT_LIVE_PATH" 'BEGIN {c=0;} /BEGIN CERT/{c++} { print > path"/cert" c ".pem"}' < "$FULLCHAIN"
+    mv "$LETS_ENCRYPT_LIVE_PATH"/cert1.pem "$CERTFILE"
+    mv "$LETS_ENCRYPT_LIVE_PATH"/cert2.pem "$CAFILE"
   fi
 
 else
+
+  echo "[INFO] No Let's encrypt live directory found"
+  echo "[INFO] Using /var/mail/ssl/selfsigned/ folder"
+
   FULLCHAIN=/var/mail/ssl/selfsigned/cert.pem
   CAFILE=
   CERTFILE=/var/mail/ssl/selfsigned/cert.pem
   KEYFILE=/var/mail/ssl/selfsigned/privkey.pem
 
-  if [ ! -e $CERTFILE ] || [ ! -e $KEYFILE ]; then
+  if [ ! -e "$CERTFILE" ] || [ ! -e "$KEYFILE" ]; then
+    echo "[INFO] No SSL certificates found, generating new selfsigned certificate"
     mkdir -p /var/mail/ssl/selfsigned/
     openssl req -new -newkey rsa:4096 -days 3658 -sha256 -nodes -x509 \
       -subj "/C=FR/ST=France/L=Paris/O=Mailserver certificate/OU=Mail/CN=*.${DOMAIN}/emailAddress=admin@${DOMAIN}" \
-      -keyout $KEYFILE \
-      -out $CERTFILE
+      -keyout "$KEYFILE" \
+      -out "$CERTFILE"
   fi
 fi
 
 # Diffie-Hellman parameters
 if [ ! -e /var/mail/ssl/dhparams/dh2048.pem ] || [ ! -e /var/mail/ssl/dhparams/dh512.pem ]; then
+  echo "[INFO] Diffie-Hellman parameters not found, generating new DH params"
   mkdir -p /var/mail/ssl/dhparams/
   openssl dhparam -out /var/mail/ssl/dhparams/dh2048.pem 2048
   openssl dhparam -out /var/mail/ssl/dhparams/dh512.pem 512
 fi
 
 # Set defaults
-:>/etc/spamassassin/local.cf
 :>/etc/opendkim/SigningTable
 :>/etc/opendkim/KeyTable
 cat > /etc/opendkim/TrustedHosts <<EOF
@@ -93,30 +111,30 @@ EOF
 domains=(${DOMAIN})
 domains+=(${ADD_DOMAINS//,/ })
 
-for domain in ${domains[@]}; do
+for domain in "${domains[@]}"; do
 
   # Generate OpenDKIM public key if it doesn't exist
-  if [ ! -e /etc/opendkim/keys/$domain/mail.private ]; then
-    mkdir -p /etc/opendkim/keys/$domain
+  if [ ! -e /etc/opendkim/keys/"$domain"/mail.private ]; then
+    mkdir -p /etc/opendkim/keys/"$domain"
     opendkim-genkey \
       --selector=mail \
-      --domain=$domain \
-      --bits=$OPENDKIM_KEY_LENGTH \
-      --directory=/etc/opendkim/keys/$domain
+      --domain="$domain" \
+      --bits="$OPENDKIM_KEY_LENGTH" \
+      --directory=/etc/opendkim/keys/"$domain"
 
-    echo "creating keys for domain $domain and adding it to whitelists"
+    echo "[INFO] Creating DKIM keys for domain $domain"
   else
-    echo "found keys for domain $domain - skip creation"
+    echo "[INFO] Found DKIM key pair for domain $domain - skip creation"
   fi
 
   # Add vhost
-  mkdir -p /var/mail/vhosts/$domain
+  mkdir -p /var/mail/vhosts/"$domain"
 
   # Whitelist domain in spamassassin
-  echo "whitelist_from *@$domain" >> /etc/spamassassin/local.cf
+  echo "whitelist_auth *@$domain" >> /etc/spamassassin/local.cf
 
-  chown opendkim:opendkim /etc/opendkim/keys/$domain/mail.private
-  chmod 400 /etc/opendkim/keys/$domain/mail.private /etc/opendkim/keys/$domain/mail.txt
+  chown opendkim:opendkim /etc/opendkim/keys/"$domain"/mail.private
+  chmod 400 /etc/opendkim/keys/"$domain"/mail.private /etc/opendkim/keys/"$domain"/mail.txt
 
   echo "mail._domainkey.$domain $domain:mail:/etc/opendkim/keys/$domain/mail.private" >> /etc/opendkim/KeyTable
   echo "*@$domain mail._domainkey.$domain" >> /etc/opendkim/SigningTable
@@ -124,20 +142,22 @@ for domain in ${domains[@]}; do
 
 done
 
-if [ ! -d $LETS_ENCRYPT_LIVE_PATH ]; then
+if [ ! -d "$LETS_ENCRYPT_LIVE_PATH" ]; then
   sed -i '/^\(smtp_tls_CAfile\|smtpd_tls_CAfile\)/s/^/#/' /etc/postfix/main.cf
 fi
 
 # Replace {{ ENV }} vars
 _envtpl() {
-  mv $1 $1".tpl" # envtpl requires files to have .tpl extension
-  envtpl $1".tpl"
+  mv "$1" "$1.tpl" # envtpl requires files to have .tpl extension
+  envtpl "$1.tpl"
 }
 
 _envtpl /etc/postfix/main.cf
+_envtpl /etc/postfix/header_checks
 _envtpl /etc/postfix/mysql/mysql-virtual-alias-maps.cf
 _envtpl /etc/postfix/mysql/mysql-virtual-mailbox-domains.cf
 _envtpl /etc/postfix/mysql/mysql-virtual-mailbox-maps.cf
+_envtpl /etc/postfix/mysql/mysql-sender-login-maps.cf
 _envtpl /etc/dovecot/conf.d/10-mail.conf
 _envtpl /etc/dovecot/dovecot-sql.conf.ext
 _envtpl /etc/dovecot/conf.d/10-ssl.conf
@@ -145,25 +165,86 @@ _envtpl /etc/dovecot/conf.d/20-lmtp.conf
 _envtpl /etc/opendkim/opendkim.conf
 _envtpl /etc/opendmarc/opendmarc.conf
 _envtpl /etc/amavis/conf.d/05-node_id
+_envtpl /etc/amavis/conf.d/50-user
 _envtpl /etc/mailname
 
+# Override Postfix configuration
+if [ -f /var/mail/postfix/custom.conf ]; then
+  while read line; do
+    echo "[INFO] Override : ${line}"
+    postconf -e "$line"
+  done < /var/mail/postfix/custom.conf
+  echo "[INFO] Custom Postfix configuration file loaded"
+else
+  echo "[INFO] No extra postfix settings loaded because optional custom configuration file (/var/mail/postfix/custom.conf) is not provided."
+fi
+
+# AMAVIS TUNING
+# ---------------
+# Set Amavis maximun number of child processes (2 Childs/Core)
+AMAVIS_MAX_PROCESS=$((`nproc` * 2))
+
+sed -i "s/AMAVIS_MAX_SERVERS/${AMAVIS_MAX_PROCESS}/" \
+  /etc/amavis/conf.d/50-user \
+  /etc/postfix/master.cf
+
+# DOVECOT TUNING
+# ---------------
+# process_min_avail = number of CPU cores, so that all of them will be used
+DOVECOT_MIN_PROCESS=$(nproc)
+
+# NbMaxUsers = ( 500 * nbCores ) / 5
+# So on a two-core server that's 1000 processes/200 users
+# with ~5 open connections per user
+DOVECOT_MAX_PROCESS=$((`nproc` * 500))
+
+sed -i -e "s/DOVECOT_MIN_PROCESS/${DOVECOT_MIN_PROCESS}/" \
+       -e "s/DOVECOT_MAX_PROCESS/${DOVECOT_MAX_PROCESS}/" /etc/dovecot/conf.d/10-master.conf
+
+# Disable virus check if asked
+if [ "$DISABLE_CLAMAV" = true ]; then
+  echo "[INFO] ClamAV is disabled, service will not start."
+  sed -i '/bypass_virus_checks_maps/,+1 s/^/#/' /etc/amavis/conf.d/15-content_filter_mode
+fi
+
+# Disable spam check if asked
+if [ "$DISABLE_SPAMASSASSIN" = true ]; then
+  echo "[INFO] SpamAssassin is disabled, service will not start."
+  sed -i '/bypass_spam_checks_maps/,+1 s/^/#/' /etc/amavis/conf.d/15-content_filter_mode
+fi
+
+# Disable Amavis if ClamAV and SpamAssassin are both disabled
+if [ "$DISABLE_CLAMAV" = true ] && [ "$DISABLE_SPAMASSASSIN" = true ]; then
+  echo "[INFO] ClamAV and SpamAssassin are both disabled, Amavis will not start."
+  sed -i '/content_filter/,+1 s/^/#/' /etc/postfix/main.cf
+fi
+
+# Disable Postgrey
+if [ "$ENABLE_POSTGREY" = false ]; then
+  sed -i '/permit_dnswl_client/,+1 s/^/#/' /etc/postfix/main.cf
+else
+  echo "[INFO] Postgrey is enabled, greylisting policy server will start."
+fi
+
 # Folders and permissions
-groupadd -g $VMAILGID vmail
-useradd -g vmail -u $VMAILUID vmail -d /var/mail
+groupadd -g "$VMAILGID" vmail
+useradd -g vmail -u "$VMAILUID" vmail -d /var/mail
 chown -R vmail:vmail /var/mail
 chown -R vmail:dovecot /etc/dovecot
 chmod -R o-rwx /etc/dovecot
 mkdir -p /var/run/dovecot
 chown -R dovecot:dovecot /var/run/dovecot
+chown -R opendkim:opendkim /etc/opendkim
+chown -R opendmarc:opendmarc /etc/opendmarc
 
 # Sieve
 mkdir -p /var/mail/sieve
 
 if [ ! -e /var/mail/sieve/default.sieve ]; then
   cat > /var/mail/sieve/default.sieve <<EOF
-require ["fileinto", "mailbox"];
-if header :contains "Subject" "*****SPAM*****" {
-  fileinto :create "Junk"; stop;
+require ["fileinto"];
+if header :contains "X-Spam-Flag" "YES" {
+  fileinto "Spam";
 }
 EOF
 fi
@@ -186,4 +267,4 @@ until mysql --host=$DBHOST --user=$DBUSER --password=$DBPASS --execute="USE $DBN
 done
 
 # RUN !
-/usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
